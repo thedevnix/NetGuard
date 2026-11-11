@@ -1,40 +1,58 @@
 # NetGuard
 
-NetGuard is a C++17 command-line network operations monitor. It checks whether configured TCP services can be reached, records every check, and tracks incidents after repeated failures. The project is designed as a small, readable demonstration of networking and operations engineering concepts.
+**A C++17 command-line monitor for TCP service availability, connection latency, and basic incident tracking.**
 
-## What it does
+NetGuard checks configured host-and-port endpoints concurrently, records every result, opens an incident after repeated failures, and records recovery when a later check succeeds. It is a small portfolio project focused on technology operations engineering concepts: service availability, diagnostics, incident lifecycle, and operational reporting.
 
-- **Monitors several endpoints concurrently.** Each configured host and port is checked in its own asynchronous task during a monitoring cycle.
-- **Resolves hostnames with the operating system resolver.** DNS errors are reported as failed checks with a diagnostic. DNS lookup time is part of the measured duration and is not bounded by NetGuard's TCP timeout.
-- **Measures TCP connection time.** NetGuard creates nonblocking TCP sockets and uses `poll()` to wait up to the configured timeout for a connection attempt. The measured time includes DNS lookup and connection setup. A successful TCP handshake confirms that a port accepted a connection; it does not prove that the application behind it is healthy.
-- **Opens incidents after two consecutive failures.** The configured P1, P2, or P3 severity is attached to the incident. Repeated failures while an incident is open do not create duplicates.
-- **Resolves an incident after recovery.** A successful check resets the failure count and records a `RESOLVED` event for any active incident for that endpoint.
-- **Writes CSV reports.** Every check is appended to `checks.csv`; incident open and resolve events are appended to `incidents.csv`.
-- **Runs for a fixed number of cycles or continuously.** Set `--cycles 0` for continuous monitoring.
+> NetGuard is a TCP reachability monitor, not a production monitoring platform. A successful TCP connection confirms that a port accepted a connection; it does not verify application behavior.
 
-## Project layout
+## Contents
 
-```text
-NetGuard/
-├── CMakeLists.txt       # C++17 build configuration and smoke test
-├── config/
-│   └── targets.csv      # Example host, port, and severity entries
-├── src/
-│   └── main.cpp         # CLI, configuration, TCP checks, incidents, and CSV output
-└── README.md            # Build, run, behavior, and limitations
-```
+- [Capabilities](#capabilities)
+- [How a check works](#how-a-check-works)
+- [Requirements](#requirements)
+- [Build](#build)
+- [Run](#run)
+- [Configure targets](#configure-targets)
+- [Incident lifecycle](#incident-lifecycle)
+- [Reports](#reports)
+- [Project structure](#project-structure)
+- [Tests](#tests)
+- [Scope and limitations](#scope-and-limitations)
+- [Engineering notes](#engineering-notes)
+
+## Capabilities
+
+- Run TCP connectivity checks for multiple configured endpoints concurrently.
+- Resolve hostnames through the operating system resolver and report DNS errors.
+- Measure elapsed time for DNS resolution and TCP connection attempts.
+- Use nonblocking POSIX sockets and `poll()` for bounded connection waits.
+- Open one P1/P2/P3 incident per endpoint after **two consecutive failures**.
+- Record a resolution event after that endpoint recovers.
+- Append monitoring results and incident events to CSV files.
+- Run a fixed number of cycles or keep monitoring until interrupted.
+
+## How a check works
+
+1. NetGuard reads and validates every target from the CSV configuration.
+2. For each monitoring cycle, it starts one asynchronous check per target using `std::async`.
+3. Each check resolves the host, tries its resolved addresses, and waits for a nonblocking TCP connection using `poll()`.
+4. NetGuard prints the results, updates each endpoint's in-memory failure/incident state, and appends CSV rows.
+5. After printing a cycle summary, it waits for the configured interval before starting again.
+
+The TCP timeout applies to connection attempts after DNS resolution. The operating system's `getaddrinfo()` call is synchronous and can take longer than the configured timeout. The reported latency includes DNS time.
 
 ## Requirements
 
 - CMake 3.16 or newer
-- A C++17 compiler
-- macOS or Linux (uses POSIX sockets)
+- A C++17-capable compiler
+- macOS or Linux (the implementation uses POSIX sockets)
 
-No third-party C++ libraries are required.
+The project has no third-party C++ dependencies. Windows requires a POSIX socket compatibility layer or a platform-specific networking implementation.
 
 ## Build
 
-From the project directory:
+From the repository root:
 
 ```bash
 cmake -S . -B build
@@ -43,77 +61,138 @@ cmake --build build
 
 ## Run
 
-Run three monitoring cycles, two seconds apart:
+Run three checks with two seconds between cycles:
 
 ```bash
 ./build/netguard --cycles 3 --interval 2
 ```
 
-Run continuously, checking every ten seconds:
+Monitor continuously, checking every ten seconds:
 
 ```bash
 ./build/netguard --cycles 0 --interval 10
 ```
 
-Choose a configuration file, TCP timeout in milliseconds, and report directory:
+Specify the target file, connection timeout, and report directory:
 
 ```bash
-./build/netguard --config config/targets.csv --timeout 1500 --reports reports
+./build/netguard \
+  --config config/targets.csv \
+  --timeout 1500 \
+  --reports reports
 ```
 
-See all supported options and defaults:
+Print command-line help:
 
 ```bash
 ./build/netguard --help
 ```
 
-Options are `--config PATH`, `--reports DIR`, `--interval SECONDS`, `--cycles N`, and `--timeout MS`. The defaults are `config/targets.csv`, `reports`, 10 seconds, one cycle, and 2000 milliseconds. The interval must be at least one second; cycles may be zero or greater; timeout must be from 1 to 60000 milliseconds.
+| Option | Default | Description |
+| --- | --- | --- |
+| `--config PATH` | `config/targets.csv` | CSV file containing endpoints to monitor. |
+| `--reports DIR` | `reports` | Directory for CSV output. Created if needed. |
+| `--interval SECONDS` | `10` | Delay between monitoring cycles; minimum is 1 second. |
+| `--cycles N` | `1` | Number of cycles. Use `0` to run continuously. |
+| `--timeout MS` | `2000` | TCP connection wait limit per check; valid range is 1–60000 ms. |
+
+Connectivity failures are recorded as monitoring results; they do not by themselves make a completed run return an error status. Invalid options, configuration errors, or report write failures return a nonzero status.
 
 ## Configure targets
 
-Edit `config/targets.csv`. Each non-comment line has this format:
+Edit `config/targets.csv`. Each non-comment row has three comma-separated fields:
 
 ```csv
-host,port,criticality
+# host,port,criticality
 example.com,443,P2
 1.1.1.1,443,P2
 localhost,9999,P3
 ```
 
-The criticality field must be `P1`, `P2`, or `P3`. The included `localhost:9999` example is expected to fail unless a service is listening on that port. To open an incident for a failing endpoint, run at least two cycles. Only check systems you own or are authorized to test.
+- `host` can be a DNS name or an IP address.
+- `port` must be an integer from 1 through 65535.
+- `criticality` must be `P1`, `P2`, or `P3` and is copied to incident records; NetGuard does not infer severity.
+
+The sample `localhost:9999` target will fail unless a service is listening on that port. Two consecutive failed cycles are needed to open an incident. Only monitor hosts and services you own or have permission to test.
+
+## Incident lifecycle
+
+Failure counts and open incidents are tracked separately for each `host:port` endpoint:
+
+```text
+Healthy ── first failed check ──> Failure pending
+Failure pending ── second consecutive failure ──> Incident open
+Incident open ── further failures ──> Incident remains open
+Incident open ── successful check ──> Incident resolved
+Failure pending ── successful check ──> Healthy
+```
+
+An endpoint's first failure does not create an incident. A success before the second failure resets its consecutive-failure count. Once an incident is open, repeated failures do not create duplicate `OPEN` events; a successful check writes a `RESOLVED` event.
 
 ## Reports
 
-NetGuard creates the report directory if needed and appends rows to:
+NetGuard creates the report directory if it does not exist. It appends to these files on each run:
 
-- `reports/checks.csv`: timestamp, host, port, healthy flag (`1` or `0`), latency in milliseconds, and a result or diagnostic.
-- `reports/incidents.csv`: timestamp, incident ID, host, port, configured severity, event (`OPEN` or `RESOLVED`), and detail.
+### `reports/checks.csv`
 
-Incident IDs start again at 1 on each program launch. CSV history remains on disk; existing reports are appended to, not rotated.
+One row for each endpoint check:
 
-## How a monitoring cycle works
+```text
+timestamp,host,port,healthy,latency_ms,detail
+```
 
-1. NetGuard loads and validates all configured targets.
-2. It launches one asynchronous TCP check per target.
-3. Each result is printed and recorded in `checks.csv`.
-4. A failed check increments that endpoint's consecutive failure count. The second consecutive failure opens one incident.
-5. A successful check clears the failure count and resolves an active incident.
-6. NetGuard prints a cycle summary and waits for the configured interval before the next cycle.
+`healthy` is `1` for a successful TCP connection and `0` for a failed check. `detail` contains `Connected` on success or a DNS, timeout, or socket diagnostic on failure. Text fields are CSV-escaped.
+
+### `reports/incidents.csv`
+
+One row for each incident open or resolution event:
+
+```text
+timestamp,id,host,port,severity,event,detail
+```
+
+`event` is `OPEN` or `RESOLVED`. IDs are sequential within a program run and restart from 1 after each launch. The active incident state is in memory only; reports persist, but open incidents are not restored after a restart. Existing CSV files are appended to and are not rotated automatically.
+
+Timestamps use the machine's local time and do not include a timezone offset.
+
+## Project structure
+
+```text
+NetGuard/
+├── CMakeLists.txt       # C++17 target, compiler warnings, thread dependency, smoke test
+├── config/
+│   └── targets.csv      # Example host, port, and criticality entries
+├── src/
+│   └── main.cpp         # CLI parsing, DNS/TCP checks, incident state, and CSV output
+├── tests/               # Reserved for additional tests
+├── include/             # Reserved for future headers as the project is split into modules
+└── README.md
+```
+
+The current implementation keeps the application in one source file to make the end-to-end flow easy to follow. It uses the C++ standard library, POSIX networking APIs, and the operating system resolver.
 
 ## Tests
 
-The CMake project registers a smoke test that checks the command-line help path:
+The CMake configuration registers a smoke test for the `--help` command:
 
 ```bash
 ctest --test-dir build --output-on-failure
 ```
 
-External connectivity depends on the local network and firewall. A restricted build environment may compile the program successfully while blocking outbound checks.
+This smoke test does not exercise external network connectivity. Reachability results depend on the machine's DNS, network, and firewall configuration.
 
 ## Scope and limitations
 
-NetGuard checks TCP reachability. It is not an ICMP ping tool, SNMP collector, service-level protocol checker, network topology mapper, or root-cause analysis system. DNS uses the operating system resolver and may take longer than the TCP timeout. Severity is supplied in the configuration rather than calculated from business impact. Incident state is held in memory, so an open incident is not restored after a restart. There is no alert delivery, authentication, or production-grade scheduling and timeout management.
+NetGuard checks whether a TCP connection can be established. It does not perform ICMP ping, SNMP polling, protocol-level health checks, topology discovery, or root-cause analysis. Severity is configured by the operator, rather than determined from business impact. DNS time is not bounded by the TCP timeout. Incident state is not durable across restarts, and the project does not include alert delivery, authentication, report rotation, or production scheduler/timeout management.
 
-## Engineering discussion
+## Engineering notes
 
-This project can be used to discuss bounded nonblocking connection attempts with `poll()`, concurrent checks with `std::async`, incident deduplication through consecutive-failure state, and the difference between port reachability and application health. Possible extensions include durable incident state, protocol-specific health checks, alerting and escalation, SLA metrics, and cloud deployment.
+The implementation demonstrates:
+
+- Concurrency with `std::async` and `std::future`.
+- Nonblocking TCP connection attempts with `fcntl()`, `connect()`, `poll()`, and `getsockopt()`.
+- DNS lookup with `getaddrinfo()` and endpoint iteration across returned addresses.
+- Incident deduplication using consecutive-failure counters and active-incident state.
+- Append-only CSV reporting with basic escaping for quoted fields.
+
+Possible next steps include protocol-aware probes, persistent incident state, alerting/escalation, report retention, and more isolated unit/integration tests.
