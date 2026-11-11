@@ -1,0 +1,4 @@
+# host,port,criticality
+example.com,443,P2
+1.1.1.1,443,P2
+localhost,9999,P3
